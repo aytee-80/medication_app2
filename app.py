@@ -178,6 +178,7 @@ def dashboard():
         else:
             med['schedule_str'] = 'N/A'
         medications.append(med)
+
     notifications = []
     current_time = datetime.now().strftime("%H:%M")
 
@@ -238,23 +239,136 @@ def save_medication():
 
     return redirect(url_for('dashboard'))
 
-# … (Keep other routes like /take_medication, /statistics, etc., updating them similarly with psycopg2)
+@app.route('/take_medication', methods=['POST'])
+def take_medication():
+    if 'user_id' not in session:
+        return redirect(url_for('home'))
 
-def send_welcome_email(email):
-    msg = Message(
-        subject="🎉 Welcome to Medication Tracker!",
-        sender=email_config.EMAIL_HOST_USER,
-        recipients=[email]
-    )
-    msg.body = """
-Hi there,
-Welcome to the Medication Tracker App!
-We're excited to help you manage your medication schedule more effectively.
-Please log in to add your first medication.
-Best regards,
-Medication Tracker Team
-"""
-    mail.send(msg)
+    med_id = request.form['med_id']
+    user_id = session['user_id']
+
+    conn = get_db_connection()
+    cur = conn.cursor()
+    cur.execute("SELECT total_pills, dosage_per_day FROM medications WHERE id = %s AND user_id = %s", (med_id, user_id))
+    med = cur.fetchone()
+
+    if med:
+        total_pills, dosage = med[0], med[1]
+        new_count = total_pills - dosage
+        today = date.today()
+
+        if new_count <= 0:
+            cur.execute("DELETE FROM medications WHERE id = %s AND user_id = %s", (med_id, user_id))
+            flash("⚠️ You're out of pills. Please refill.")
+        else:
+            cur.execute("""
+                UPDATE medications
+                SET total_pills = %s, last_taken = %s
+                WHERE id = %s AND user_id = %s
+            """, (new_count, today, med_id, user_id))
+
+        conn.commit()
+    cur.close()
+    conn.close()
+
+    return redirect(url_for('dashboard'))
+
+@app.route('/statistics')
+def statistics():
+    if 'user_id' not in session:
+        return redirect(url_for('home'))
+
+    user_id = session['user_id']
+    conn = get_db_connection()
+    cur = conn.cursor()
+    cur.execute("SELECT name, dosage_per_day, total_pills, last_taken FROM medications WHERE user_id = %s", (user_id,))
+    meds = cur.fetchall()
+    stats = {
+        "total_medications": len(meds),
+        "total_doses_scheduled": 0,
+        "total_doses_taken": 0,
+        "missed_doses": 0,
+        "adherence_rate": 0
+    }
+
+    for med in meds:
+        name, dosage, total_pills, last_taken = med
+        if last_taken:
+            days_prescribed = (datetime.now().date() - last_taken).days
+            scheduled_doses = max(0, days_prescribed * dosage)
+            taken_doses = total_pills // dosage if total_pills else 0
+        else:
+            scheduled_doses = 0
+            taken_doses = 0
+        stats["total_doses_scheduled"] += scheduled_doses
+        stats["total_doses_taken"] += taken_doses
+
+    stats["missed_doses"] = max(0, stats["total_doses_scheduled"] - stats["total_doses_taken"])
+    if stats["total_doses_scheduled"] > 0:
+        stats["adherence_rate"] = round((stats["total_doses_taken"] / stats["total_doses_scheduled"]) * 100, 2)
+
+    cur.close()
+    conn.close()
+    return render_template('statistics.html', stats=stats)
+
+@app.route('/export_statistics/csv')
+def export_csv():
+    if 'user_id' not in session:
+        return redirect(url_for('home'))
+
+    user_id = session['user_id']
+    conn = get_db_connection()
+    cur = conn.cursor()
+    cur.execute("SELECT name, dosage_per_day, total_pills, last_taken FROM medications WHERE user_id = %s", (user_id,))
+    meds = cur.fetchall()
+    df = pd.DataFrame(meds, columns=['Name', 'Dosage per Day', 'Total Pills', 'Last Taken'])
+
+    si = StringIO()
+    df.to_csv(si, index=False)
+    output = make_response(si.getvalue())
+    output.headers["Content-Disposition"] = "attachment; filename=medication_stats.csv"
+    output.headers["Content-type"] = "text/csv"
+    cur.close()
+    conn.close()
+    return output
+
+@app.route('/export_statistics/pdf')
+def export_pdf():
+    if 'user_id' not in session:
+        return redirect(url_for('home'))
+
+    user_id = session['user_id']
+    conn = get_db_connection()
+    cur = conn.cursor()
+    cur.execute("SELECT name, dosage_per_day, total_pills, last_taken FROM medications WHERE user_id = %s", (user_id,))
+    meds = cur.fetchall()
+
+    buffer = io.BytesIO()
+    doc = SimpleDocTemplate(buffer)
+    styles = getSampleStyleSheet()
+    story = [Paragraph("📄 Medication Report", styles['Title']), Spacer(1, 24)]
+
+    for med in meds:
+        name, dosage, total, last_taken = med
+        last_taken_str = last_taken.strftime("%Y-%m-%d") if last_taken else "N/A"
+        med_info = f"<b>Name:</b> {name}<br/><b>Dosage/Day:</b> {dosage}<br/><b>Total Pills:</b> {total}<br/><b>Last Taken:</b> {last_taken_str}"
+        story.append(Paragraph(med_info, styles['Normal']))
+        story.append(Spacer(1, 12))
+
+    doc.build(story)
+    pdf_output = buffer.getvalue()
+    buffer.close()
+    response = make_response(pdf_output)
+    response.headers['Content-Disposition'] = 'attachment; filename=medication_report.pdf'
+    response.headers['Content-Type'] = 'application/pdf'
+    cur.close()
+    conn.close()
+    return response
+
+@app.route('/logout')
+def logout():
+    session.pop('user_id', None)
+    return redirect(url_for('home'))
 
 # Scheduler for reminders
 def send_reminder_emails():
@@ -315,10 +429,80 @@ def start_scheduler():
         scheduler_started = True
         atexit.register(lambda: scheduler.shutdown())
 
-@app.route('/logout')
-def logout():
-    session.pop('user_id', None)
-    return redirect(url_for('home'))
+@app.route('/education')
+def education():
+    if 'user_id' not in session:
+        return redirect(url_for('home'))
+    return render_template('education.html')
+
+@app.route('/safety')
+def safety():
+    if 'user_id' not in session:
+        return redirect(url_for('home'))
+    return render_template('safety.html')
+
+@app.route('/print_guide')
+def print_guide():
+    if 'user_id' not in session:
+        return redirect(url_for('home'))
+
+    user_id = session['user_id']
+    conn = get_db_connection()
+    cur = conn.cursor()
+    cur.execute("SELECT id, name, dosage_per_day, total_pills, schedule, last_taken, description FROM medications WHERE user_id = %s", (user_id,))
+    meds = cur.fetchall()
+    columns = [desc[0] for desc in cur.description]
+    medications = []
+
+    for row in meds:
+        med = dict(zip(columns, row))
+        if isinstance(med['schedule'], timedelta):
+            seconds = med['schedule'].total_seconds()
+            hours, remainder = divmod(seconds, 3600)
+            minutes, _ = divmod(remainder, 60)
+            med['schedule_str'] = f"{int(hours):02d}:{int(minutes):02d}"
+        elif med['schedule']:
+            med['schedule_str'] = str(med['schedule'])[:5]
+        else:
+            med['schedule_str'] = 'N/A'
+        medications.append(med)
+
+    cur.close()
+    conn.close()
+    return render_template('print_guide.html', medications=medications)
+
+@app.route('/delete_medication', methods=['POST'])
+def delete_medication():
+    if 'user_id' not in session:
+        return redirect(url_for('home'))
+
+    med_id = request.form['med_id']
+    user_id = session['user_id']
+
+    conn = get_db_connection()
+    cur = conn.cursor()
+    cur.execute("DELETE FROM medications WHERE id = %s AND user_id = %s", (med_id, user_id))
+    conn.commit()
+    cur.close()
+    conn.close()
+
+    return redirect(url_for('dashboard'))
+
+def send_welcome_email(email):
+    msg = Message(
+        subject="🎉 Welcome to Medication Tracker!",
+        sender=email_config.EMAIL_HOST_USER,
+        recipients=[email]
+    )
+    msg.body = """
+Hi there,
+Welcome to the Medication Tracker App!
+We're excited to help you manage your medication schedule more effectively.
+Please log in to add your first medication.
+Best regards,
+Medication Tracker Team
+"""
+    mail.send(msg)
 
 # Run the app
 if __name__ == '__main__':
